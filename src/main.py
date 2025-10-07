@@ -1,10 +1,9 @@
 import os
 import re
-import math
 import time
 import random
 import logging
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Set
 
 import pandas as pd
 import requests
