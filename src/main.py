@@ -1,4 +1,4 @@
-import os
+from pathlib import Path
 import re
 import time
 import random
@@ -12,49 +12,66 @@ from newspaper import Article
 import textstat
 import nltk
 
-# configure logging
+# --------------------
+# Configuration / constants
+# --------------------
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+EXTRACTED_DIR = PROJECT_ROOT / 'extracted_texts'
+INPUT_FILE = PROJECT_ROOT / 'Input.xlsx'
+POS_DICT = PROJECT_ROOT / 'MasterDictionary' / 'positive-words.txt'
+NEG_DICT = PROJECT_ROOT / 'MasterDictionary' / 'negative-words.txt'
+STOPWORDS_DIR = PROJECT_ROOT / 'StopWords'
+OUTPUT_XLSX = PROJECT_ROOT / 'output_analysis.xlsx'
+OUTPUT_CSV = PROJECT_ROOT / 'output_analysis.csv'
+
+MAX_ATTEMPTS = 3
+BACKOFF_BASE = 1.5
+
+# configure logging (human pref: INFO, clear format)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
-# Ensure required NLTK data
-nltk.download('punkt', quiet=True)
-nltk.download('stopwords', quiet=True)
+
+def ensure_nltk(download: bool = False):
+    """Ensure required NLTK data is available. To avoid runtime side-effects, optionally download when asked."""
+    if download:
+        nltk.download('punkt', quiet=True)
+        nltk.download('stopwords', quiet=True)
+
+
 from nltk.tokenize import word_tokenize, sent_tokenize
 from nltk.corpus import stopwords as nltk_stopwords
 
 # requests session
 SESSION = requests.Session()
-# small set of user agents to rotate
+# small set of user agents to rotate (kept short intentionally)
 USER_AGENTS = [
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.5938.92 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.5938.92 Safari/537.36'
 ]
 
 
-def load_excel(file_path):
+def load_excel(file_path: Path):
     return pd.read_excel(file_path)
 
 
-def load_text(file_path):
+def load_text(file_path: Path) -> List[str]:
     encodings = ("utf-8", "utf-8-sig", "latin-1")
     for enc in encodings:
         try:
-            with open(file_path, 'r', encoding=enc) as file:
-                return [line.rstrip('\n') for line in file]
+            with file_path.open('r', encoding=enc) as fh:
+                return [line.rstrip('\n') for line in fh]
         except UnicodeDecodeError:
             continue
-    with open(file_path, 'r', encoding='latin-1', errors='replace') as file:
-        return [line.rstrip('\n') for line in file]
+    with file_path.open('r', encoding='latin-1', errors='replace') as fh:
+        return [line.rstrip('\n') for line in fh]
 
 
-def fetch_html(url):
+def fetch_html(url: str) -> str | None:
     """Fetch a URL with retries, UA rotation and exponential backoff.
 
     Returns the page HTML on success, or None on repeated failure.
     """
-    max_attempts = 3
-    backoff_base = 1.5
-    for attempt in range(1, max_attempts + 1):
+    for attempt in range(1, MAX_ATTEMPTS + 1):
         ua = random.choice(USER_AGENTS)
         headers = {
             'User-Agent': ua,
@@ -67,22 +84,22 @@ def fetch_html(url):
         except requests.HTTPError as e:
             status = getattr(e.response, 'status_code', None)
             logging.warning('Attempt %d: HTTP %s for %s', attempt, status, url)
-            # if 406/403, try again with a different UA after sleeping
-            if attempt == max_attempts:
+            # if all attempts exhausted, log and return None
+            if attempt == MAX_ATTEMPTS:
                 logging.error('Failed fetching %s after %d attempts: %s', url, attempt, e)
                 return None
         except requests.RequestException as e:
             logging.warning('Attempt %d: RequestException for %s: %s', attempt, url, e)
-            if attempt == max_attempts:
+            if attempt == MAX_ATTEMPTS:
                 logging.error('Failed fetching %s after %d attempts: %s', url, attempt, e)
                 return None
         # exponential backoff
-        sleep_time = backoff_base ** attempt
+        sleep_time = BACKOFF_BASE ** attempt
         time.sleep(sleep_time)
     return None
 
 
-def extract_article(html):
+def extract_article(html: str) -> tuple[str, str]:
     """Attempt to extract title and article body using newspaper3k, fallback to BeautifulSoup heuristics."""
     # try newspaper Article if possible
     try:
@@ -93,9 +110,8 @@ def extract_article(html):
         body = a.text or ''
         if body.strip():
             return title, body
-    except Exception:
-        # fall through to soup heuristic
-        pass
+    except Exception as exc:  # keep a small note for maintainers
+        logging.debug('newspaper3k extraction failed, falling back to soup: %s', exc)
 
     soup = BeautifulSoup(html, 'html.parser')
     # title heuristic
@@ -136,12 +152,13 @@ def clean_and_tokenize(text: str) -> List[str]:
     return tokens
 
 
-def count_syllables(word):
+def count_syllables(word: str) -> int:
     try:
         # textstat returns syllable count per word
         s = textstat.syllable_count(word)
         return max(1, s) if s is not None else 1
-    except Exception:
+    except Exception as exc:
+        logging.debug('syllable count fallback for %s: %s', word, exc)
         # fallback heuristic
         return max(1, len(re.findall(r'[aeiouyAEIOUY]+', word)))
 
@@ -208,31 +225,31 @@ def analyze_text(original_text: str, pos_set: Set[str], neg_set: Set[str], stopw
     }
 
 
-def load_stopwords(stopwords_dir='StopWords'):
+def load_stopwords(stopwords_dir: Path = STOPWORDS_DIR) -> Set[str]:
     sw = set()
-    if not os.path.isdir(stopwords_dir):
+    if not stopwords_dir.is_dir():
         return sw
-    for fname in os.listdir(stopwords_dir):
-        path = os.path.join(stopwords_dir, fname)
-        if os.path.isfile(path):
-            lines = load_text(path)
+    for fname in stopwords_dir.iterdir():
+        if fname.is_file():
+            lines = load_text(fname)
             sw.update([l.strip().lower() for l in lines if l and not l.startswith('#')])
     return sw
 
 
-def ensure_dir(path):
-    os.makedirs(path, exist_ok=True)
+def ensure_dir(path: Path):
+    path.mkdir(parents=True, exist_ok=True)
 
 
 def main(test_mode=False, test_limit=1):
-    df = load_excel('Input.xlsx')
-    pos_set = set(w.lower() for w in load_text('MasterDictionary/positive-words.txt'))
-    neg_set = set(w.lower() for w in load_text('MasterDictionary/negative-words.txt'))
-    stopwords = load_stopwords('StopWords')
+    # optionally ensure NLTK downloaded by caller; default: skip download at import-time
+    df = load_excel(INPUT_FILE)
+    pos_set = set(w.lower() for w in load_text(POS_DICT))
+    neg_set = set(w.lower() for w in load_text(NEG_DICT))
+    stopwords = load_stopwords(STOPWORDS_DIR)
     # add NLTK stopwords (union) for robust removal
     stopwords = stopwords.union({s.lower() for s in nltk_stopwords.words('english')})
 
-    ensure_dir('extracted_texts')
+    ensure_dir(EXTRACTED_DIR)
 
     results = []
     rows = df.to_dict('records')
@@ -255,18 +272,18 @@ def main(test_mode=False, test_limit=1):
                 status = 'ERROR'
                 error_msg = str(e)
             # Save extracted text
-            filename = os.path.join('extracted_texts', f"{url_id}.txt")
+            filename = EXTRACTED_DIR / f"{url_id}.txt"
             try:
                 with open(filename, 'w', encoding='utf-8') as fh:
                     fh.write(title + '\n' + body)
-            except Exception as e:
-                print(f"Error writing {filename}: {e}")
+            except OSError as exc:
+                logging.error('Error writing %s: %s', filename, exc)
                 status = 'ERROR'
-                error_msg = str(e)
+                error_msg = str(exc)
         else:
             status = 'FETCH_FAILED'
             error_msg = f'Failed to fetch {url}'
-            print(f"Skipping analysis for {url} because fetch failed.")
+            logging.info('Skipping analysis for %s because fetch failed.', url)
 
         analysis = analyze_text((title + '\n' + body).strip(), pos_set, neg_set, stopwords)
 
@@ -304,7 +321,12 @@ def main(test_mode=False, test_limit=1):
 
 
 if __name__ == '__main__':
-    test_mode = os.environ.get('TEST_MODE') == '1'
+    import os as _os
+
+    test_mode = _os.environ.get('TEST_MODE') == '1'
     # if TEST_LIMIT env var present, use it
-    test_limit = int(os.environ.get('TEST_LIMIT', '1')) if test_mode else 0
+    test_limit = int(_os.environ.get('TEST_LIMIT', '1')) if test_mode else 0
+    # if you want NLTK resources downloaded when running main, set DOWNLOAD_NLTK=1
+    if _os.environ.get('DOWNLOAD_NLTK') == '1':
+        ensure_nltk(download=True)
     main(test_mode=test_mode, test_limit=test_limit)
